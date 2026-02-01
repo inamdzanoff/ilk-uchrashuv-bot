@@ -4,28 +4,24 @@ import sqlite3
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
-
 # Logging sozlamalari
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
 # ===== SOZLAMALAR =====
 BOT_TOKEN = "8229151254:AAEXHvhQQajyQhRAqYzDPaGwiOQjqnCqxqM"
 DATABASE_FILE = "tanishuvlar_bot.db"
-
 # Conversation states
 REGISTER_NAME, REGISTER_AGE, REGISTER_GENDER, REGISTER_REGION = range(4)
-
+BROADCAST_PHOTO, BROADCAST_CAPTION = range(4, 6)
 # Viloyatlar ro'yxati
 REGIONS = [
     "Toshkent", "Samarqand", "Buxoro", "Andijon", "Farg'ona",
     "Namangan", "Qashqadaryo", "Surxondaryo", "Xorazm", "Navoiy",
     "Jizzax", "Sirdaryo", "Qoraqalpog'iston"
 ]
-
 # Premium narxlari (so'mda)
 PREMIUM_PRICES = {
     "1_day": 3000,
@@ -33,15 +29,18 @@ PREMIUM_PRICES = {
     "1_week": 15000,
     "1_month": 55000
 }
-
+# Referral yulduzlar bilan premium narxlari
+STAR_PRICES = {
+    "1_day": 10,
+    "1_week": 30,
+    "1_month": 60
+}
 # ===== DATABASE FUNKSIYALARI =====
-
 def get_db_connection():
     """Database ulanishini olish"""
     conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row  # Dict kabi ishlashi uchun
+    conn.row_factory = sqlite3.Row
     return conn
-
 def init_database():
     """Databaseni yaratish"""
     conn = get_db_connection()
@@ -61,9 +60,31 @@ def init_database():
             current_partner_id INTEGER,
             is_premium INTEGER DEFAULT 0,
             premium_expires_at TEXT,
+            stars INTEGER DEFAULT 0,
+            referral_code TEXT UNIQUE,
+            referred_by INTEGER,
+            referral_count INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Referral code ustunini qo'shish (agar mavjud bo'lmasa)
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN stars INTEGER DEFAULT 0')
+    except:
+        pass
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_code TEXT UNIQUE')
+    except:
+        pass
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN referred_by INTEGER')
+    except:
+        pass
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0')
+    except:
+        pass
     
     # Chat sessions jadvali
     cursor.execute('''
@@ -117,7 +138,11 @@ def init_database():
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully")
-
+def generate_referral_code(telegram_id: int) -> str:
+    """Foydalanuvchi uchun referral kod yaratish"""
+    import hashlib
+    hash_object = hashlib.md5(str(telegram_id).encode())
+    return hash_object.hexdigest()[:8].upper()
 def get_user(telegram_id: int):
     """Foydalanuvchini bazadan olish"""
     conn = get_db_connection()
@@ -126,7 +151,6 @@ def get_user(telegram_id: int):
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
 def get_user_by_id(user_id: int):
     """Foydalanuvchini ID bo'yicha olish"""
     conn = get_db_connection()
@@ -135,18 +159,25 @@ def get_user_by_id(user_id: int):
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
-def create_user(telegram_id: int, username: str, full_name: str, age: int, gender: str, region: str):
+def get_user_by_referral_code(referral_code: str):
+    """Foydalanuvchini referral kod bo'yicha olish"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE referral_code = ?', (referral_code.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+def create_user(telegram_id: int, username: str, full_name: str, age: int, gender: str, region: str, referred_by: int = None):
     """Yangi foydalanuvchi yaratish"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    referral_code = generate_referral_code(telegram_id)
     cursor.execute('''
-        INSERT INTO users (telegram_id, username, full_name, age, gender, region)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (telegram_id, username, full_name, age, gender, region))
+        INSERT INTO users (telegram_id, username, full_name, age, gender, region, referral_code, referred_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (telegram_id, username, full_name, age, gender, region, referral_code, referred_by))
     conn.commit()
     conn.close()
-
 def update_user(user_id: int, **kwargs):
     """Foydalanuvchini yangilash"""
     conn = get_db_connection()
@@ -158,7 +189,33 @@ def update_user(user_id: int, **kwargs):
     cursor.execute(f'UPDATE users SET {set_clause} WHERE id = ?', values)
     conn.commit()
     conn.close()
-
+def add_stars(user_id: int, stars: int):
+    """Foydalanuvchiga yulduz qo'shish"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET stars = stars + ? WHERE id = ?', (stars, user_id))
+    conn.commit()
+    conn.close()
+def use_stars(user_id: int, stars: int) -> bool:
+    """Foydalanuvchidan yulduz ayirish"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT stars FROM users WHERE id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row and row[0] >= stars:
+        cursor.execute('UPDATE users SET stars = stars - ? WHERE id = ?', (stars, user_id))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+def increment_referral_count(user_id: int):
+    """Referral hisoblagichini oshirish"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET referral_count = referral_count + 1 WHERE id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 def get_bot_settings():
     """Bot sozlamalarini olish"""
     conn = get_db_connection()
@@ -167,7 +224,6 @@ def get_bot_settings():
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
 def find_searching_user(exclude_user_id: int, gender: str = None):
     """Qidirayotgan foydalanuvchini topish"""
     conn = get_db_connection()
@@ -189,7 +245,6 @@ def find_searching_user(exclude_user_id: int, gender: str = None):
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
 def create_chat_session(user1_id: int, user2_id: int):
     """Chat sessiyasini yaratish"""
     conn = get_db_connection()
@@ -200,7 +255,6 @@ def create_chat_session(user1_id: int, user2_id: int):
     ''', (user1_id, user2_id))
     conn.commit()
     conn.close()
-
 def end_chat_session(user1_id: int, user2_id: int, ended_by: int):
     """Chat sessiyasini tugatish"""
     conn = get_db_connection()
@@ -213,7 +267,6 @@ def end_chat_session(user1_id: int, user2_id: int, ended_by: int):
     ''', (datetime.now().isoformat(), ended_by, user1_id, user2_id, user2_id, user1_id))
     conn.commit()
     conn.close()
-
 def create_payment(user_id: int, plan: str, amount: int):
     """To'lov yaratish"""
     conn = get_db_connection()
@@ -226,7 +279,6 @@ def create_payment(user_id: int, plan: str, amount: int):
     conn.commit()
     conn.close()
     return payment_id
-
 def get_pending_payment(user_id: int):
     """Kutilayotgan to'lovni olish"""
     conn = get_db_connection()
@@ -240,7 +292,6 @@ def get_pending_payment(user_id: int):
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
-
 def update_payment(payment_id: int, **kwargs):
     """To'lovni yangilash"""
     conn = get_db_connection()
@@ -252,9 +303,23 @@ def update_payment(payment_id: int, **kwargs):
     cursor.execute(f'UPDATE payments SET {set_clause} WHERE id = ?', values)
     conn.commit()
     conn.close()
-
+def check_expired_premiums():
+    """Muddati o'tgan premiumlarni tekshirish va o'chirish"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute('''
+        UPDATE users 
+        SET is_premium = 0, premium_expires_at = NULL
+        WHERE is_premium = 1 AND premium_expires_at < ?
+    ''', (now,))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if affected > 0:
+        logger.info(f"Expired {affected} premium subscriptions")
+    return affected
 # ===== YORDAMCHI FUNKSIYALAR =====
-
 def is_premium(user: dict) -> bool:
     """Foydalanuvchi premiummi tekshirish"""
     if not user or not user.get("is_premium"):
@@ -263,11 +328,14 @@ def is_premium(user: dict) -> bool:
     if expires:
         try:
             expires_dt = datetime.fromisoformat(expires)
-            return expires_dt > datetime.now()
+            if expires_dt <= datetime.now():
+                # Premium muddati tugagan, yangilash
+                update_user(user['id'], is_premium=0, premium_expires_at=None)
+                return False
+            return True
         except Exception:
             return False
     return False
-
 def get_main_keyboard(user: dict):
     """Asosiy klaviatura"""
     premium = is_premium(user)
@@ -275,21 +343,30 @@ def get_main_keyboard(user: dict):
     keyboard = [
         ["🔍 Suhbatdosh izlash"],
         ["👤 Mening profilim", "💎 Premium"],
+        ["🌟 Referral"]
     ]
     
     if premium:
         keyboard.insert(1, ["👦 O'g'il izlash", "👧 Qiz izlash"])
     
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
 # ===== BOT HANDLERLARI =====
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start komandasi"""
     telegram_id = update.effective_user.id
     user = get_user(telegram_id)
     
+    # Referral kodni tekshirish
+    referral_code = None
+    if context.args and len(context.args) > 0:
+        referral_code = context.args[0]
+        context.user_data['referral_code'] = referral_code
+    
     if user:
+        # Premium muddatini tekshirish
+        check_expired_premiums()
+        user = get_user(telegram_id)  # Yangilangan ma'lumotni olish
+        
         await update.message.reply_text(
             f"Salom, {user['full_name']}! 👋\n\nSuhbatdosh izlash uchun tugmani bosing.",
             reply_markup=get_main_keyboard(user)
@@ -302,13 +379,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
         return REGISTER_NAME
-
 async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ism qabul qilish"""
     context.user_data['full_name'] = update.message.text
     await update.message.reply_text("Yoshingizni kiriting (masalan: 20):")
     return REGISTER_AGE
-
 async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Yosh qabul qilish"""
     try:
@@ -324,7 +399,6 @@ async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup([["👦 Erkak", "👧 Ayol"]], resize_keyboard=True)
     await update.message.reply_text("Jinsingizni tanlang:", reply_markup=keyboard)
     return REGISTER_GENDER
-
 async def register_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Jins qabul qilish"""
     text = update.message.text
@@ -342,7 +416,6 @@ async def register_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("Viloyatingizni tanlang:", reply_markup=keyboard)
     return REGISTER_REGION
-
 async def register_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Viloyat qabul qilish va ro'yxatdan o'tkazish"""
     region = update.message.text
@@ -353,6 +426,27 @@ async def register_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     username = update.effective_user.username
     
+    # Referral tekshirish
+    referred_by = None
+    referral_code = context.user_data.get('referral_code')
+    if referral_code:
+        referrer = get_user_by_referral_code(referral_code)
+        if referrer and referrer['telegram_id'] != telegram_id:
+            referred_by = referrer['id']
+            # Referrerga 3 yulduz qo'shish
+            add_stars(referrer['id'], 3)
+            increment_referral_count(referrer['id'])
+            # Referrerga xabar yuborish
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer['telegram_id'],
+                    text=f"🎉 Tabriklaymiz! Sizning referral havolangiz orqali yangi foydalanuvchi qo'shildi!\n\n"
+                         f"⭐ +3 yulduz qo'shildi!\n"
+                         f"💫 Jami yulduzlaringiz: {referrer['stars'] + 3}"
+                )
+            except:
+                pass
+    
     try:
         create_user(
             telegram_id=telegram_id,
@@ -360,16 +454,24 @@ async def register_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
             full_name=context.user_data['full_name'],
             age=context.user_data['age'],
             gender=context.user_data['gender'],
-            region=region
+            region=region,
+            referred_by=referred_by
         )
         user = get_user(telegram_id)
         
-        await update.message.reply_text(
+        welcome_msg = (
             f"✅ Ro'yxatdan o'tdingiz!\n\n"
             f"👤 Ism: {user['full_name']}\n"
             f"🎂 Yosh: {user['age']}\n"
             f"📍 Viloyat: {user['region']}\n\n"
-            f"Endi suhbatdosh izlashingiz mumkin!",
+            f"Endi suhbatdosh izlashingiz mumkin!"
+        )
+        
+        if referred_by:
+            welcome_msg += "\n\n🎁 Siz referral orqali keldingiz!"
+        
+        await update.message.reply_text(
+            welcome_msg,
             reply_markup=get_main_keyboard(user)
         )
     except Exception as e:
@@ -377,7 +479,160 @@ async def register_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Xatolik yuz berdi. Qaytadan urinib ko'ring: /start")
     
     return ConversationHandler.END
-
+async def referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Referral menyusi"""
+    telegram_id = update.effective_user.id
+    user = get_user(telegram_id)
+    
+    if not user:
+        await update.message.reply_text("Avval ro'yxatdan o'ting: /start")
+        return
+    
+    # Referral kodni yaratish (agar mavjud bo'lmasa)
+    if not user.get('referral_code'):
+        referral_code = generate_referral_code(telegram_id)
+        update_user(user['id'], referral_code=referral_code)
+        user['referral_code'] = referral_code
+    
+    bot_username = (await context.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start={user['referral_code']}"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌟 Yulduzlar bilan premium olish", callback_data="star_premium")]
+    ])
+    
+    await update.message.reply_text(
+        f"🌟 <b>REFERRAL TIZIMI</b>\n\n"
+        f"📊 Sizning statistikangiz:\n"
+        f"⭐ Yulduzlar: <b>{user.get('stars', 0)}</b>\n"
+        f"👥 Taklif qilganlar: <b>{user.get('referral_count', 0)}</b>\n\n"
+        f"🔗 Sizning referral havolangiz:\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"📌 Qanday ishlaydi:\n"
+        f"1️⃣ Havolani do'stlaringizga yuboring\n"
+        f"2️⃣ Har bir ro'yxatdan o'tgan do'st uchun <b>3 yulduz</b> olasiz\n"
+        f"3️⃣ Yulduzlar bilan premium sotib oling!\n\n"
+        f"💎 <b>Premium narxlari (yulduzlarda):</b>\n"
+        f"• 1 kun - 10 ⭐\n"
+        f"• 1 hafta - 30 ⭐\n"
+        f"• 1 oy - 60 ⭐",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+async def star_premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yulduzlar bilan premium olish menyusi"""
+    query = update.callback_query
+    await query.answer()
+    
+    telegram_id = query.from_user.id
+    user = get_user(telegram_id)
+    
+    if not user:
+        await query.edit_message_text("Avval ro'yxatdan o'ting: /start")
+        return
+    
+    stars = user.get('stars', 0)
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"1 kun - 10 ⭐ {'✅' if stars >= 10 else '❌'}", callback_data="buy_star_1_day")],
+        [InlineKeyboardButton(f"1 hafta - 30 ⭐ {'✅' if stars >= 30 else '❌'}", callback_data="buy_star_1_week")],
+        [InlineKeyboardButton(f"1 oy - 60 ⭐ {'✅' if stars >= 60 else '❌'}", callback_data="buy_star_1_month")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_referral")]
+    ])
+    
+    await query.edit_message_text(
+        f"💎 <b>YULDUZLAR BILAN PREMIUM</b>\n\n"
+        f"⭐ Sizning yulduzlaringiz: <b>{stars}</b>\n\n"
+        f"Quyidagi tariflardan birini tanlang:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+async def buy_star_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yulduzlar bilan premium sotib olish"""
+    query = update.callback_query
+    await query.answer()
+    
+    telegram_id = query.from_user.id
+    user = get_user(telegram_id)
+    
+    if not user:
+        await query.edit_message_text("Avval ro'yxatdan o'ting: /start")
+        return
+    
+    plan = query.data.replace("buy_star_", "")
+    star_cost = STAR_PRICES.get(plan, 0)
+    
+    if user.get('stars', 0) < star_cost:
+        await query.answer(f"Sizda yetarli yulduz yo'q! Kerak: {star_cost} ⭐", show_alert=True)
+        return
+    
+    days_map = {"1_day": 1, "1_week": 7, "1_month": 30}
+    days = days_map.get(plan)
+    
+    if not days:
+        await query.answer("Xatolik yuz berdi!", show_alert=True)
+        return
+    
+    # Yulduzlarni ayirish
+    if use_stars(user['id'], star_cost):
+        # Premiumni faollashtirish
+        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
+        update_user(user['id'], is_premium=1, premium_expires_at=expires_at)
+        
+        user = get_user(telegram_id)
+        
+        await query.edit_message_text(
+            f"🎉 <b>Tabriklaymiz!</b>\n\n"
+            f"💎 Premium {days} kunga faollashtirildi!\n"
+            f"⏰ Amal qilish: {datetime.fromisoformat(expires_at).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"⭐ Qolgan yulduzlaringiz: {user.get('stars', 0)}",
+            parse_mode="HTML"
+        )
+        
+        # Asosiy klaviaturani yangilash
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text="Endi premium imkoniyatlardan foydalanishingiz mumkin!",
+            reply_markup=get_main_keyboard(user)
+        )
+    else:
+        await query.answer("Xatolik yuz berdi!", show_alert=True)
+async def back_to_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Referral menyusiga qaytish"""
+    query = update.callback_query
+    await query.answer()
+    
+    telegram_id = query.from_user.id
+    user = get_user(telegram_id)
+    
+    if not user:
+        return
+    
+    bot_username = (await context.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start={user['referral_code']}"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌟 Yulduzlar bilan premium olish", callback_data="star_premium")]
+    ])
+    
+    await query.edit_message_text(
+        f"🌟 <b>REFERRAL TIZIMI</b>\n\n"
+        f"📊 Sizning statistikangiz:\n"
+        f"⭐ Yulduzlar: <b>{user.get('stars', 0)}</b>\n"
+        f"👥 Taklif qilganlar: <b>{user.get('referral_count', 0)}</b>\n\n"
+        f"🔗 Sizning referral havolangiz:\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"📌 Qanday ishlaydi:\n"
+        f"1️⃣ Havolani do'stlaringizga yuboring\n"
+        f"2️⃣ Har bir ro'yxatdan o'tgan do'st uchun <b>3 yulduz</b> olasiz\n"
+        f"3️⃣ Yulduzlar bilan premium sotib oling!\n\n"
+        f"💎 <b>Premium narxlari (yulduzlarda):</b>\n"
+        f"• 1 kun - 10 ⭐\n"
+        f"• 1 hafta - 30 ⭐\n"
+        f"• 1 oy - 60 ⭐",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 async def search_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Suhbatdosh izlash"""
     telegram_id = update.effective_user.id
@@ -386,6 +641,10 @@ async def search_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start")
         return
+    
+    # Premium muddatini tekshirish
+    check_expired_premiums()
+    user = get_user(telegram_id)
     
     # Foydalanuvchini qidiruv rejimiga o'tkazish
     update_user(user['id'], is_searching=1, current_partner_id=None)
@@ -407,7 +666,7 @@ async def search_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg = "✅ Suhbatdosh topildi!\n\n"
         if is_premium(user):
             user_msg += f"👤 Ism: {partner['full_name']}\n🎂 Yosh: {partner['age']}\n📍 Viloyat: {partner['region']}\n\n"
-        user_msg += "Xabar yozing, u sizning suhbatdoshingizga yuboriladi."
+        user_msg += "Xabar yozing, u sizning suhbatdoshingizga yuboriladi.\n\n⚠️ Faqat matn xabarlari yuboriladi."
         
         await update.message.reply_text(user_msg, reply_markup=stop_keyboard)
         
@@ -416,7 +675,7 @@ async def search_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         partner_msg = "✅ Suhbatdosh topildi!\n\n"
         if is_premium(partner_user):
             partner_msg += f"👤 Ism: {user['full_name']}\n🎂 Yosh: {user['age']}\n📍 Viloyat: {user['region']}\n\n"
-        partner_msg += "Xabar yozing, u sizning suhbatdoshingizga yuboriladi."
+        partner_msg += "Xabar yozing, u sizning suhbatdoshingizga yuboriladi.\n\n⚠️ Faqat matn xabarlari yuboriladi."
         
         await context.bot.send_message(
             chat_id=partner['telegram_id'],
@@ -429,7 +688,6 @@ async def search_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kutib turing, tez orada topiladi!",
             reply_markup=ReplyKeyboardMarkup([["❌ Qidiruvni bekor qilish"]], resize_keyboard=True)
         )
-
 async def search_by_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Jins bo'yicha qidirish (faqat premium)"""
     telegram_id = update.effective_user.id
@@ -438,6 +696,10 @@ async def search_by_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start")
         return
+    
+    # Premium muddatini tekshirish
+    check_expired_premiums()
+    user = get_user(telegram_id)
     
     if not is_premium(user):
         await update.message.reply_text(
@@ -470,7 +732,7 @@ async def search_by_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 Ism: {partner['full_name']}\n"
             f"🎂 Yosh: {partner['age']}\n"
             f"📍 Viloyat: {partner['region']}\n\n"
-            "Xabar yozing!",
+            "Xabar yozing!\n\n⚠️ Faqat matn xabarlari yuboriladi.",
             reply_markup=stop_keyboard
         )
         
@@ -478,7 +740,7 @@ async def search_by_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
         partner_msg = "✅ Suhbatdosh topildi!\n\n"
         if is_premium(partner_user):
             partner_msg += f"👤 Ism: {user['full_name']}\n🎂 Yosh: {user['age']}\n📍 Viloyat: {user['region']}\n\n"
-        partner_msg += "Xabar yozing!"
+        partner_msg += "Xabar yozing!\n\n⚠️ Faqat matn xabarlari yuboriladi."
         
         await context.bot.send_message(
             chat_id=partner['telegram_id'],
@@ -492,7 +754,6 @@ async def search_by_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kutib turing!",
             reply_markup=ReplyKeyboardMarkup([["❌ Qidiruvni bekor qilish"]], resize_keyboard=True)
         )
-
 async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Suhbatni tugatish"""
     telegram_id = update.effective_user.id
@@ -530,7 +791,6 @@ async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Suhbat tugatildi.",
         reply_markup=get_main_keyboard(user)
     )
-
 async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Qidiruvni bekor qilish"""
     telegram_id = update.effective_user.id
@@ -543,7 +803,6 @@ async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Qidiruv bekor qilindi.",
             reply_markup=get_main_keyboard(user)
         )
-
 async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Profil ko'rish"""
     telegram_id = update.effective_user.id
@@ -552,6 +811,10 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start")
         return
+    
+    # Premium muddatini tekshirish
+    check_expired_premiums()
+    user = get_user(telegram_id)
     
     premium_status = "✅ Premium" if is_premium(user) else "❌ Oddiy"
     expires = ""
@@ -568,9 +831,9 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎂 Yosh: {user['age']}\n"
         f"👤 Jins: {'Erkak' if user['gender'] == 'male' else 'Ayol'}\n"
         f"📍 Viloyat: {user['region']}\n"
+        f"⭐ Yulduzlar: {user.get('stars', 0)}\n"
         f"⭐ Status: {premium_status}{expires}"
     )
-
 async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Premium menyu"""
     telegram_id = update.effective_user.id
@@ -579,6 +842,10 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start")
         return
+    
+    # Premium muddatini tekshirish
+    check_expired_premiums()
+    user = get_user(telegram_id)
     
     settings = get_bot_settings()
     
@@ -616,7 +883,6 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💎 Narxlar:",
             reply_markup=keyboard
         )
-
 async def buy_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Premium sotib olish"""
     query = update.callback_query
@@ -662,13 +928,20 @@ async def buy_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"To'lovni amalga oshiring va screenshotini yuboring.",
         parse_mode='Markdown'
     )
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Screenshot qabul qilish"""
+    """Screenshot qabul qilish (faqat to'lov uchun)"""
     telegram_id = update.effective_user.id
     user = get_user(telegram_id)
     
     if not user:
+        return
+    
+    # Agar chatda bo'lsa, rasm yuborishga ruxsat yo'q
+    if user.get('current_partner_id'):
+        await update.message.reply_text(
+            "⚠️ Suhbatda rasm yuborish mumkin emas!\n"
+            "Faqat matn xabarlari yuboriladi."
+        )
         return
     
     # Oxirgi pending to'lovni topish
@@ -688,16 +961,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Odatda bu 1-24 soat davom etadi.",
             reply_markup=get_main_keyboard(user)
         )
-    else:
-        # Agar partner bilan chatda bo'lsa, rasmni forward qilish
-        if user.get('current_partner_id'):
-            partner = get_user_by_id(user['current_partner_id'])
-            if partner:
-                await context.bot.send_photo(
-                    chat_id=partner['telegram_id'],
-                    photo=update.message.photo[-1].file_id
-                )
-
+async def handle_media_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chatda media yuborishga ruxsat bermash"""
+    telegram_id = update.effective_user.id
+    user = get_user(telegram_id)
+    
+    if not user:
+        return
+    
+    if user.get('current_partner_id'):
+        await update.message.reply_text(
+            "⚠️ Suhbatda media yuborish mumkin emas!\n"
+            "Faqat matn xabarlari yuboriladi."
+        )
 async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xabarlarni forward qilish"""
     telegram_id = update.effective_user.id
@@ -722,6 +998,9 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "💎 Premium":
         await premium_menu(update, context)
         return
+    elif text == "🌟 Referral":
+        await referral_menu(update, context)
+        return
     elif text == "🛑 Suhbatni tugatish":
         await stop_chat(update, context)
         return
@@ -737,67 +1016,11 @@ async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=partner['telegram_id'],
                 text=text
             )
-
-async def forward_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stikerlarni forward qilish"""
-    telegram_id = update.effective_user.id
-    user = get_user(telegram_id)
-    
-    if user and user.get('current_partner_id'):
-        partner = get_user_by_id(user['current_partner_id'])
-        if partner:
-            await context.bot.send_sticker(
-                chat_id=partner['telegram_id'],
-                sticker=update.message.sticker.file_id
-            )
-
-async def forward_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ovozli xabarlarni forward qilish"""
-    telegram_id = update.effective_user.id
-    user = get_user(telegram_id)
-    
-    if user and user.get('current_partner_id'):
-        partner = get_user_by_id(user['current_partner_id'])
-        if partner:
-            await context.bot.send_voice(
-                chat_id=partner['telegram_id'],
-                voice=update.message.voice.file_id
-            )
-
-async def forward_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Videolarni forward qilish"""
-    telegram_id = update.effective_user.id
-    user = get_user(telegram_id)
-    
-    if user and user.get('current_partner_id'):
-        partner = get_user_by_id(user['current_partner_id'])
-        if partner:
-            await context.bot.send_video(
-                chat_id=partner['telegram_id'],
-                video=update.message.video.file_id
-            )
-
-async def forward_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Hujjatlarni forward qilish"""
-    telegram_id = update.effective_user.id
-    user = get_user(telegram_id)
-    
-    if user and user.get('current_partner_id'):
-        partner = get_user_by_id(user['current_partner_id'])
-        if partner:
-            await context.bot.send_document(
-                chat_id=partner['telegram_id'],
-                document=update.message.document.file_id
-            )
-
 # ===== ADMIN SOZLAMALARI =====
 ADMIN_IDS = [1652304805]  # O'zingizning telegram ID larni qo'shing
-
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
 # ===== ADMIN BUYRUQLARI =====
-
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """📊 /stats - Umumiy statistika"""
     if not is_admin(update.effective_user.id):
@@ -831,6 +1054,12 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT COUNT(*) FROM chat_sessions")
     total_chats = c.fetchone()[0]
     
+    c.execute("SELECT SUM(stars) FROM users")
+    total_stars = c.fetchone()[0] or 0
+    
+    c.execute("SELECT SUM(referral_count) FROM users")
+    total_referrals = c.fetchone()[0] or 0
+    
     # Bugungi statistika
     today = datetime.now().date().isoformat()
     c.execute("SELECT COUNT(*) FROM users WHERE DATE(created_at) = ?", (today,))
@@ -851,11 +1080,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 Kutilayotgan to'lovlar: <b>{pending_payments}</b>\n"
         f"✅ Tasdiqlangan to'lovlar: <b>{approved_payments}</b>\n"
         f"💰 Jami daromad: <b>{total_income:,}</b> so'm\n\n"
+        f"⭐ Jami yulduzlar: <b>{total_stars}</b>\n"
+        f"👥 Jami referrallar: <b>{total_referrals}</b>\n\n"
         f"📈 Jami suhbatlar: <b>{total_chats}</b>",
         parse_mode="HTML"
     )
-
-
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """👥 /users - Foydalanuvchilar ro'yxati"""
     if not is_admin(update.effective_user.id):
@@ -866,7 +1095,7 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Oxirgi 20 ta foydalanuvchi
     c.execute("""
-        SELECT telegram_id, full_name, age, gender, region, is_premium, created_at 
+        SELECT telegram_id, full_name, age, gender, region, is_premium, stars, referral_count, created_at 
         FROM users 
         ORDER BY created_at DESC 
         LIMIT 20
@@ -882,12 +1111,10 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in users:
         gender = "👦" if u['gender'] == 'male' else "👧"
         premium = "💎" if u['is_premium'] else ""
-        text += f"{gender} {u['full_name']}, {u['age']} yosh, {u['region']} {premium}\n"
-        text += f"   ID: <code>{u['telegram_id']}</code>\n\n"
+        text += f"{gender} {u['full_name']}, {u['age']} yosh {premium}\n"
+        text += f"   ⭐{u['stars'] or 0} 👥{u['referral_count'] or 0} ID: <code>{u['telegram_id']}</code>\n\n"
     
     await update.message.reply_text(text, parse_mode="HTML")
-
-
 async def admin_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💳 /payments - Kutilayotgan to'lovlar"""
     if not is_admin(update.effective_user.id):
@@ -936,8 +1163,6 @@ async def admin_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(text, parse_mode="HTML")
         else:
             await update.message.reply_text(text + "\n\n⚠️ Screenshot yuklanmagan!", parse_mode="HTML")
-
-
 async def admin_approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """✅ /approve <telegram_id> <plan> - To'lovni tasdiqlash"""
     if not is_admin(update.effective_user.id):
@@ -996,8 +1221,47 @@ async def admin_approve_payment(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Telegram ID raqam bo'lishi kerak!")
     except Exception as e:
         await update.message.reply_text(f"❌ Xatolik: {e}")
-
-
+async def admin_remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """❌ /removepremium <telegram_id> - Premiumni olib tashlash"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    try:
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text("❌ Foydalanish: /removepremium <telegram_id>")
+            return
+        
+        user_telegram_id = int(args[0])
+        
+        user = get_user(user_telegram_id)
+        if not user:
+            await update.message.reply_text("❌ Foydalanuvchi topilmadi!")
+            return
+        
+        if not user.get('is_premium'):
+            await update.message.reply_text("❌ Bu foydalanuvchi premium emas!")
+            return
+        
+        # Premiumni olib tashlash
+        update_user(user['id'], is_premium=0, premium_expires_at=None)
+        
+        # Foydalanuvchiga xabar
+        try:
+            await context.bot.send_message(
+                chat_id=user_telegram_id,
+                text="⚠️ Sizning Premium obunangiz bekor qilindi.",
+                reply_markup=get_main_keyboard(get_user(user_telegram_id))
+            )
+        except:
+            pass
+        
+        await update.message.reply_text(f"✅ {user['full_name']} dan premium olib tashlandi!")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Telegram ID raqam bo'lishi kerak!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Xatolik: {e}")
 async def admin_reject_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """❌ /reject <telegram_id> <sabab> - To'lovni rad etish"""
     if not is_admin(update.effective_user.id):
@@ -1038,18 +1302,58 @@ async def admin_reject_payment(update: Update, context: ContextTypes.DEFAULT_TYP
         
     except Exception as e:
         await update.message.reply_text(f"❌ Xatolik: {e}")
-
-
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """📢 /broadcast <xabar> - Hammaga xabar yuborish"""
+# Broadcast uchun kontekst saqlash
+broadcast_data = {}
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📢 /broadcast - Hammaga xabar yuborish (yangi usul)"""
     if not is_admin(update.effective_user.id):
-        return
+        return ConversationHandler.END
     
-    message = " ".join(context.args)
-    if not message:
-        await update.message.reply_text("❌ Foydalanish: /broadcast <xabar>")
-        return
+    await update.message.reply_text(
+        "📸 Habarni yuboring:\n\n"
+        "Rasm yuklang (izoh bilan yoki izohsiz) yoki faqat matn yuboring.\n\n"
+        "Bekor qilish: /cancel"
+    )
+    return BROADCAST_PHOTO
+async def admin_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast uchun rasm va caption qabul qilish"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
     
+    user_id = update.effective_user.id
+    
+    if update.message.photo:
+        # Rasm yuklandi
+        photo = update.message.photo[-1]
+        caption = update.message.caption or ""
+        
+        broadcast_data[user_id] = {
+            'type': 'photo',
+            'photo_id': photo.file_id,
+            'caption': caption
+        }
+        
+        # Hammaga yuborish
+        return await send_broadcast(update, context, broadcast_data[user_id])
+        
+    elif update.message.text:
+        # Faqat matn
+        if update.message.text == "/cancel":
+            await update.message.reply_text("❌ Broadcast bekor qilindi.")
+            return ConversationHandler.END
+        
+        broadcast_data[user_id] = {
+            'type': 'text',
+            'text': update.message.text
+        }
+        
+        # Hammaga yuborish
+        return await send_broadcast(update, context, broadcast_data[user_id])
+    
+    await update.message.reply_text("❌ Rasm yoki matn yuboring!")
+    return BROADCAST_PHOTO
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    """Broadcast yuborish"""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT telegram_id FROM users")
@@ -1063,11 +1367,19 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for user in users:
         try:
-            await context.bot.send_message(
-                chat_id=user['telegram_id'],
-                text=f"📢 <b>ADMIN XABARI</b>\n\n{message}",
-                parse_mode="HTML"
-            )
+            if data['type'] == 'photo':
+                await context.bot.send_photo(
+                    chat_id=user['telegram_id'],
+                    photo=data['photo_id'],
+                    caption=data.get('caption', ''),
+                    parse_mode="HTML"
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=user['telegram_id'],
+                    text=data['text'],
+                    parse_mode="HTML"
+                )
             success += 1
         except Exception:
             failed += 1
@@ -1075,8 +1387,11 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Yuborildi: {success}\n❌ Xato: {failed}"
     )
-
-
+    return ConversationHandler.END
+async def admin_broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast bekor qilish"""
+    await update.message.reply_text("❌ Broadcast bekor qilindi.")
+    return ConversationHandler.END
 async def admin_setcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💳 /setcard <karta_raqami> - Karta raqamini o'zgartirish"""
     if not is_admin(update.effective_user.id):
@@ -1094,8 +1409,6 @@ async def admin_setcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     await update.message.reply_text(f"✅ Karta raqami o'zgartirildi:\n<code>{card}</code>", parse_mode="HTML")
-
-
 async def admin_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💰 /setprice <plan> <narx> - Narxni o'zgartirish"""
     if not is_admin(update.effective_user.id):
@@ -1135,8 +1448,6 @@ async def admin_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except ValueError:
         await update.message.reply_text("❌ Narx raqam bo'lishi kerak!")
-
-
 async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🚫 /ban <telegram_id> - Foydalanuvchini bloklash"""
     if not is_admin(update.effective_user.id):
@@ -1160,8 +1471,6 @@ async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         await update.message.reply_text(f"❌ Xatolik: {e}")
-
-
 async def admin_premium_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💎 /premiums - Premium foydalanuvchilar"""
     if not is_admin(update.effective_user.id):
@@ -1184,15 +1493,43 @@ async def admin_premium_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     text = "💎 <b>PREMIUM FOYDALANUVCHILAR:</b>\n\n"
     for u in users:
-        expires = datetime.fromisoformat(u['premium_expires_at']).strftime('%d.%m.%Y')
+        expires = datetime.fromisoformat(u['premium_expires_at']).strftime('%d.%m.%Y %H:%M')
         text += f"👤 {u['full_name']} - {expires} gacha\n"
-        text += f"   ID: <code>{u['telegram_id']}</code>\n\n"
+        text += f"   ID: <code>{u['telegram_id']}</code>\n"
+        text += f"   /removepremium {u['telegram_id']}\n\n"
     
     await update.message.reply_text(text, parse_mode="HTML")
-
-
-# ... boshqa admin funksiyalar (admin_stats, admin_users, admin_ban, etc.)
-
+async def admin_add_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⭐ /addstars <telegram_id> <amount> - Yulduz qo'shish"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    try:
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("❌ Foydalanish: /addstars <telegram_id> <amount>")
+            return
+        
+        user_telegram_id = int(args[0])
+        amount = int(args[1])
+        
+        user = get_user(user_telegram_id)
+        if not user:
+            await update.message.reply_text("❌ Foydalanuvchi topilmadi!")
+            return
+        
+        add_stars(user['id'], amount)
+        user = get_user(user_telegram_id)
+        
+        await update.message.reply_text(
+            f"✅ {user['full_name']} ga {amount} yulduz qo'shildi!\n"
+            f"⭐ Jami: {user.get('stars', 0)}"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ ID va miqdor raqam bo'lishi kerak!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Xatolik: {e}")
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """📚 /admin - Admin buyruqlari"""
     if not is_admin(update.effective_user.id):
@@ -1205,70 +1542,18 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💎 /premiums - Premium ro'yxati\n\n"
         "💳 /payments - Kutilayotgan to'lovlar\n"
         "✅ /approve [id] [plan] - Tasdiqlash\n"
-        "❌ /reject [id] [sabab] - Rad etish\n\n"
-        "📢 /broadcast [xabar] - Hammaga yuborish\n"
+        "❌ /reject [id] [sabab] - Rad etish\n"
+        "🚫 /removepremium [id] - Premium olib tashlash\n\n"
+        "📢 /broadcast - Hammaga xabar (rasm + matn)\n"
         "🚫 /ban [id] - Bloklash\n\n"
+        "⭐ /addstars [id] [amount] - Yulduz qo'shish\n\n"
         "⚙️ /setcard [raqam] - Karta o'zgartirish\n"
         "💰 /setprice [plan] [narx] - Narx o'zgartirish\n\n"
         "<i>Plan: 1_day, 3_days, 1_week, 1_month</i>",
         parse_mode="HTML"
     )
-
-# ===== MAIN FUNKSIYAGA QO'SHISH =====
-# main() funksiyasida application.add_handler qatorlaridan keyin qo'shing:
-
-def main():
-    init_database()
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Ro'yxatdan o'tish
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
-            REGISTER_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_age)],
-            REGISTER_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_gender)],
-            REGISTER_REGION: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_region)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-    )
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("premium", premium_menu))
-    application.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_"))
-    
-    # ✅ ADMIN HANDLERLARI - SHU QATORLAR BOR EKANINI TEKSHIRING!
-    application.add_handler(CommandHandler("admin", admin_help))
-    application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CommandHandler("users", admin_users))
-    application.add_handler(CommandHandler("payments", admin_payments))
-    application.add_handler(CommandHandler("approve", admin_approve_payment))
-    application.add_handler(CommandHandler("reject", admin_reject_payment))
-    application.add_handler(CommandHandler("broadcast", admin_broadcast))
-    application.add_handler(CommandHandler("setcard", admin_setcard))
-    application.add_handler(CommandHandler("setprice", admin_setprice))
-    application.add_handler(CommandHandler("ban", admin_ban))
-    application.add_handler(CommandHandler("premiums", admin_premium_list))
-    
-    # Boshqa handlerlar
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Sticker.ALL, forward_sticker))
-    application.add_handler(MessageHandler(filters.VOICE, forward_voice))
-    application.add_handler(MessageHandler(filters.VIDEO, forward_video))
-    application.add_handler(MessageHandler(filters.Document.ALL, forward_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_message))
-    
-    logger.info("Bot ishga tushdi!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
-
-
-
 def main():
     """Botni ishga tushirish"""
-    # Databaseni yaratish
     init_database()
     
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1285,19 +1570,53 @@ def main():
         fallbacks=[CommandHandler("start", start)],
     )
     
+    # Broadcast conversation
+    broadcast_handler = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", admin_broadcast_start)],
+        states={
+            BROADCAST_PHOTO: [
+                MessageHandler(filters.PHOTO, admin_broadcast_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_broadcast_cancel)],
+    )
+    
     application.add_handler(conv_handler)
+    application.add_handler(broadcast_handler)
     application.add_handler(CommandHandler("premium", premium_menu))
+    application.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_(?!star)"))
+    application.add_handler(CallbackQueryHandler(star_premium_menu, pattern="^star_premium$"))
+    application.add_handler(CallbackQueryHandler(buy_star_premium, pattern="^buy_star_"))
+    application.add_handler(CallbackQueryHandler(back_to_referral, pattern="^back_to_referral$"))
+    
+    # Admin handlerlari
+    application.add_handler(CommandHandler("admin", admin_help))
+    application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CommandHandler("users", admin_users))
+    application.add_handler(CommandHandler("payments", admin_payments))
     application.add_handler(CommandHandler("approve", admin_approve_payment))
-    application.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_"))
+    application.add_handler(CommandHandler("reject", admin_reject_payment))
+    application.add_handler(CommandHandler("removepremium", admin_remove_premium))
+    application.add_handler(CommandHandler("setcard", admin_setcard))
+    application.add_handler(CommandHandler("setprice", admin_setprice))
+    application.add_handler(CommandHandler("ban", admin_ban))
+    application.add_handler(CommandHandler("premiums", admin_premium_list))
+    application.add_handler(CommandHandler("addstars", admin_add_stars))
+    
+    # Media handlerlar - chatda taqiqlangan
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Sticker.ALL, forward_sticker))
-    application.add_handler(MessageHandler(filters.VOICE, forward_voice))
-    application.add_handler(MessageHandler(filters.VIDEO, forward_video))
-    application.add_handler(MessageHandler(filters.Document.ALL, forward_document))
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handle_media_in_chat))
+    application.add_handler(MessageHandler(filters.VOICE, handle_media_in_chat))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_media_in_chat))
+    application.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_media_in_chat))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_media_in_chat))
+    application.add_handler(MessageHandler(filters.AUDIO, handle_media_in_chat))
+    
+    # Matn xabarlari
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_message))
     
     logger.info("Bot ishga tushdi! Database: " + DATABASE_FILE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 if __name__ == "__main__":
     main()
