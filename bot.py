@@ -74,7 +74,7 @@ def init_database():
     except:
         pass
     try:
-        cursor.execute('ALTER TABLE users ADD COLUMN referral_code TEXT UNIQUE')
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_code TEXT')
     except:
         pass
     try:
@@ -85,7 +85,11 @@ def init_database():
         cursor.execute('ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0')
     except:
         pass
-    
+    try:
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users(referral_code)')
+    except:
+        pass
+
     # Chat sessions jadvali
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -1620,3 +1624,4 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__ == "__main__":
     main()
+
